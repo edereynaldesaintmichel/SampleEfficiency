@@ -13,8 +13,12 @@ spectral norms of hidden-matrix differences (embeddings/norms excluded) with a
 row-permutation baseline to judge whether the seeds landed in the same region
 of the loss landscape or are as far apart as independent random models.
 
+Size arguments (--train_bytes etc.) are bytes of underlying text; for BPE
+datasets they are converted to token counts via the split's tokens/bytes
+ratio, and bpb for train.bin slices uses byte counts estimated the same way.
+
 Example:
-  python gen_probe.py --data data/enwik8_10mb_v256 --run_name probe10
+  python gen_probe.py --data data/shakespeare_v2048 --run_name probe10
 """
 
 import argparse
@@ -35,7 +39,7 @@ from train import EMA, pick_device
 
 def get_args():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data", type=str, default="data/enwik8_10mb_v256")
+    ap.add_argument("--data", type=str, default="data/shakespeare_v2048")
     ap.add_argument("--run_name", type=str, default="gen_probe")
     ap.add_argument("--out_dir", type=str, default="runs")
     # experiment
@@ -50,7 +54,7 @@ def get_args():
     ap.add_argument("--n_head", type=int, default=5)
     ap.add_argument("--n_embd", type=int, default=320)
     ap.add_argument("--block_size", type=int, default=1024)
-    ap.add_argument("--dropout", type=float, default=0.2)
+    ap.add_argument("--dropout", type=float, default=0.3)
     ap.add_argument("--attn_dropout", type=float, default=-1.0)
     ap.add_argument("--softcap", type=float, default=30.0)
     # optimization
@@ -227,17 +231,27 @@ def main():
 
     with open(os.path.join(args.data, "meta.json")) as f:
         meta = json.load(f)
-    assert meta["dtype"] == "uint8", "gen_probe assumes byte-level data (tokens == bytes)"
-    train_ids = np.fromfile(os.path.join(args.data, "train.bin"), dtype=np.uint8)
-    val_np = np.fromfile(os.path.join(args.data, "val.bin"), dtype=np.uint8)
-    if args.val_limit_bytes > 0:
-        val_np = val_np[:args.val_limit_bytes]
-    assert len(train_ids) >= args.train_bytes + args.proxy_bytes
+    dtype = np.uint8 if meta["dtype"] == "uint8" else np.uint16
+    train_ids = np.fromfile(os.path.join(args.data, "train.bin"), dtype=dtype)
+    val_np = np.fromfile(os.path.join(args.data, "val.bin"), dtype=dtype)
 
-    train_sub = train_ids[:args.train_bytes]
-    train_eval_ids = torch.from_numpy(train_sub[:args.train_eval_bytes].astype(np.int64))
+    # size args are bytes of text; convert to token counts via the split ratios
+    bpt_train = meta["train_bytes"] / meta["train_tokens"]
+    bpt_val = meta["val_bytes"] / meta["val_tokens"]
+    n_train = round(args.train_bytes / bpt_train)
+    n_proxy = round(args.proxy_bytes / bpt_train)
+    n_train_eval = round(args.train_eval_bytes / bpt_train)
+    assert len(train_ids) >= n_train + n_proxy
+    if args.val_limit_bytes > 0:
+        val_np = val_np[:round(args.val_limit_bytes / bpt_val)]
+        val_bytes = len(val_np) * bpt_val
+    else:
+        val_bytes = meta["val_bytes"]
+
+    train_sub = train_ids[:n_train]
+    train_eval_ids = torch.from_numpy(train_sub[:n_train_eval].astype(np.int64))
     proxy_ids = torch.from_numpy(
-        train_ids[args.train_bytes:args.train_bytes + args.proxy_bytes].astype(np.int64))
+        train_ids[n_train:n_train + n_proxy].astype(np.int64))
     val_ids = torch.from_numpy(val_np.astype(np.int64))
 
     cfg = GPTConfig(
@@ -252,8 +266,11 @@ def main():
 
     seeds = [args.seed0 + k for k in range(args.n_seeds)]
     print(f"device={device}  seeds={seeds}")
-    print(f"train subset: {len(train_sub):,}B  proxy: {len(proxy_ids):,}B  "
-          f"val: {len(val_ids):,}B  steps={args.steps}  wd={args.weight_decay}")
+    print(f"vocab={meta['vocab_size']}  bytes/token train={bpt_train:.3f}")
+    print(f"train subset: {len(train_sub):,} tok (~{args.train_bytes:,}B)  "
+          f"proxy: {len(proxy_ids):,} tok (~{args.proxy_bytes:,}B)  "
+          f"val: {len(val_ids):,} tok (~{val_bytes:,.0f}B)  "
+          f"steps={args.steps}  wd={args.weight_decay}")
 
     metrics: list[dict] = []
     hiddens: list[dict[str, torch.Tensor]] = []
@@ -270,11 +287,11 @@ def main():
         m = {
             "seed": seed,
             "final_running_loss": running_loss,
-            "train_bpb": evaluate_bpb(eval_model, train_eval_ids, len(train_eval_ids),
+            "train_bpb": evaluate_bpb(eval_model, train_eval_ids, len(train_eval_ids) * bpt_train,
                                       args.block_size, args.eval_batch_size, device),
-            "proxy_bpb": evaluate_bpb(eval_model, proxy_ids, len(proxy_ids),
+            "proxy_bpb": evaluate_bpb(eval_model, proxy_ids, len(proxy_ids) * bpt_train,
                                       args.block_size, args.eval_batch_size, device),
-            "val_bpb": evaluate_bpb(eval_model, val_ids, len(val_ids),
+            "val_bpb": evaluate_bpb(eval_model, val_ids, val_bytes,
                                     args.block_size, args.eval_batch_size, device),
         }
         hid = {n: p.detach().float().cpu().clone()
