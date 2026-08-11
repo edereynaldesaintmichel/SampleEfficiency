@@ -219,6 +219,32 @@ def kl_matrix(models: list[GPT], ids: torch.Tensor, block_size: int,
     return kl / total
 
 
+class Ensemble(torch.nn.Module):
+    """Prediction-averaging ensemble, API-compatible with evaluate_bpb.
+    mode='prob': arithmetic mean of probabilities; 'logprob': geometric mean."""
+
+    def __init__(self, models: list[GPT], mode: str = "prob"):
+        super().__init__()
+        self.models = torch.nn.ModuleList(models)
+        self.cfg = models[0].cfg
+        self.mode = mode
+
+    def forward(self, x, targets=None, loss_reduction="mean"):
+        acc = None
+        for m in self.models:
+            logits, _ = m(x)
+            t = (F.softmax(logits.float(), dim=-1) if self.mode == "prob"
+                 else F.log_softmax(logits.float(), dim=-1))
+            acc = t if acc is None else acc + t
+        acc = acc / len(self.models)
+        logp = acc.clamp_min(1e-12).log() if self.mode == "prob" else F.log_softmax(acc, dim=-1)
+        if targets is None:
+            return logp, None
+        loss = F.nll_loss(logp.view(-1, logp.size(-1)), targets.reshape(-1),
+                          ignore_index=-1, reduction=loss_reduction)
+        return logp, loss
+
+
 def spec(A: torch.Tensor) -> float:
     return torch.linalg.matrix_norm(A.float(), ord=2).item()
 
@@ -380,13 +406,23 @@ def main():
     kl_bits = kl_matrix(models, kl_ids, args.block_size, args.kl_batch_size,
                         device) / math.log(2)
     kl_sym = 0.5 * (kl_bits + kl_bits.T)
-    del models
     n_kl_tok = len(kl_ids) // args.block_size * args.block_size
     print(f"symmetrized KL, bits/token, over {n_kl_tok:,} val tokens:")
     print(fmt_matrix([str(s) for s in seeds], kl_sym))
     iu = np.triu_indices(len(seeds), 1)
     print(f"mean pairwise sym-KL: {kl_sym[iu].mean():.4f} bits/token  "
           f"(for scale: val bpb std across seeds is {cols['val_bpb'].std(ddof=1):.4f})")
+
+    print("\n=== ensemble val bpb (average predictions of all seeds) ===", flush=True)
+    ens_prob = evaluate_bpb(Ensemble(models, "prob"), val_ids, val_bytes,
+                            args.block_size, args.eval_batch_size, device)
+    ens_logp = evaluate_bpb(Ensemble(models, "logprob"), val_ids, val_bytes,
+                            args.block_size, args.eval_batch_size, device)
+    best_single = float(cols["val_bpb"].min())
+    print(f"single models: mean {cols['val_bpb'].mean():.4f}  best {best_single:.4f}")
+    print(f"ensemble: prob-avg {ens_prob:.4f}  logprob-avg {ens_logp:.4f}  "
+          f"(gain vs best single: {best_single - ens_prob:+.4f} bpb)")
+    del models
 
     hiddens = [hidden_from_sd(sd) for sd in state_dicts]
     print("\n=== spectral analysis of hidden matrices ===", flush=True)
@@ -417,6 +453,7 @@ def main():
         "pearson": pearson.tolist(), "spearman": spearman.tolist(),
         "pearson_perm_pvals": pvals.tolist(), "corr_names": names,
         "kl_bits": kl_bits.tolist(), "kl_sym_bits": kl_sym.tolist(),
+        "ensemble_val_bpb_prob": ens_prob, "ensemble_val_bpb_logprob": ens_logp,
         "spectral_ratio": ratio.tolist(), "spectral_ratio_baseline": base_ratio.tolist(),
         "cosine": cos.tolist(), "cosine_baseline": base_cos.tolist(),
         "spectral_summary": summ, "verdict": verdict,
