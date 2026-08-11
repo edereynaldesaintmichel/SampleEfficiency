@@ -9,6 +9,7 @@ Example:
 """
 
 import argparse
+import contextlib
 import copy
 import json
 import math
@@ -56,6 +57,7 @@ def get_args():
     ap.add_argument("--log_interval", type=int, default=50)
     ap.add_argument("--seed", type=int, default=1337)
     ap.add_argument("--device", type=str, default="auto")
+    ap.add_argument("--no_amp", action="store_true", help="disable bf16 autocast (CUDA only; evals always run fp32)")
     ap.add_argument("--compile", action="store_true")
     return ap.parse_args()
 
@@ -93,6 +95,9 @@ def main():
     device = pick_device(args.device)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
+    torch.set_float32_matmul_precision("high")  # TF32 on CUDA
+    amp_ctx = (torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+               if device == "cuda" and not args.no_amp else contextlib.nullcontext())
 
     with open(os.path.join(args.data, "meta.json")) as f:
         meta = json.load(f)
@@ -168,7 +173,8 @@ def main():
                 g["lr"] = m * peak
 
         x, y = get_batch()
-        _, loss = model(x, y)
+        with amp_ctx:
+            _, loss = model(x, y)
         for opt in optimizers:
             opt.zero_grad(set_to_none=True)
         loss.backward()
