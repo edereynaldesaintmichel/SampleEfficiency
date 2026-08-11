@@ -8,10 +8,12 @@ for all measurements. For each seed measures:
   proxy_bpb  - bpb on the next 100KB of train.bin (same distribution, never seen)
   val_bpb    - bpb on the real val split
 
-then reports Pearson/Spearman correlation matrices across seeds, and pairwise
+then reports Pearson/Spearman correlation matrices across seeds, pairwise
 spectral norms of hidden-matrix differences (embeddings/norms excluded) with a
 row-permutation baseline to judge whether the seeds landed in the same region
-of the loss landscape or are as far apart as independent random models.
+of the loss landscape or are as far apart as independent random models, and
+pairwise KL divergence of next-token distributions on val data (functional
+distance, complementing the weight-space one).
 
 Size arguments (--train_bytes etc.) are bytes of underlying text; for BPE
 datasets they are converted to token counts via the split's tokens/bytes
@@ -31,6 +33,7 @@ import time
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from evaluation import evaluate_bpb
 from model import GPT, GPTConfig
@@ -71,6 +74,10 @@ def get_args():
     ap.add_argument("--ema_decay", type=float, default=0.999)
     # eval / misc
     ap.add_argument("--eval_batch_size", type=int, default=16)
+    ap.add_argument("--kl_bytes", type=int, default=-1,
+                    help="val bytes for pairwise KL; -1 = full (possibly limited) val split")
+    ap.add_argument("--kl_batch_size", type=int, default=4,
+                    help="blocks per KL batch (all models' log-probs held at once)")
     ap.add_argument("--log_interval", type=int, default=100)
     ap.add_argument("--device", type=str, default="auto")
     ap.add_argument("--no_amp", action="store_true", help="disable bf16 autocast (CUDA only)")
@@ -173,11 +180,43 @@ def corr_matrices(cols: dict[str, np.ndarray], n_perm: int = 10000):
 
 
 def fmt_matrix(names: list[str], M: np.ndarray) -> str:
-    w = max(len(n) for n in names) + 2
+    w = max(max(len(n) for n in names) + 2, 8)
     lines = [" " * w + "".join(f"{n:>{w}}" for n in names)]
     for i, n in enumerate(names):
         lines.append(f"{n:>{w}}" + "".join(f"{M[i, j]:>{w}.3f}" for j in range(len(names))))
     return "\n".join(lines)
+
+
+def hidden_from_sd(sd: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    return {k: v for k, v in sd.items()
+            if v.ndim == 2 and "embed" not in k and "lm_head" not in k}
+
+
+@torch.no_grad()
+def kl_matrix(models: list[GPT], ids: torch.Tensor, block_size: int,
+              batch_size: int, device: str) -> np.ndarray:
+    """kl[i, j] = mean over tokens of KL(p_i || p_j), in nats/token, computed
+    on non-overlapping blocks of `ids` (all positions scored)."""
+    n = len(models)
+    for m in models:
+        m.eval()
+    nblk = len(ids) // block_size
+    xs = ids[:nblk * block_size].view(nblk, block_size)
+    kl = np.zeros((n, n))
+    total = 0
+    for b0 in range(0, nblk, batch_size):
+        x = xs[b0:b0 + batch_size].to(device)
+        lps = []
+        for m in models:
+            logits, _ = m(x)
+            lps.append(F.log_softmax(logits.float(), dim=-1))
+        for i in range(n):
+            p = lps[i].exp()
+            for j in range(n):
+                if i != j:
+                    kl[i, j] += (p * (lps[i] - lps[j])).sum(-1).sum().item()
+        total += x.numel()
+    return kl / total
 
 
 def spec(A: torch.Tensor) -> float:
@@ -279,15 +318,17 @@ def main():
           f"steps={args.steps}  wd={args.weight_decay}")
 
     metrics: list[dict] = []
-    hiddens: list[dict[str, torch.Tensor]] = []
+    state_dicts: list[dict[str, torch.Tensor]] = []
     for seed in seeds:
         ckpt_path = os.path.join(run_dir, f"seed{seed}.pt")
         if os.path.exists(ckpt_path) and not args.no_resume:
             ck = torch.load(ckpt_path, map_location="cpu", weights_only=True)
-            print(f"seed {seed}: loaded cached result")
-            metrics.append(ck["metrics"])
-            hiddens.append(ck["hidden"])
-            continue
+            if "state_dict" in ck:
+                print(f"seed {seed}: loaded cached result")
+                metrics.append(ck["metrics"])
+                state_dicts.append(ck["state_dict"])
+                continue
+            print(f"seed {seed}: cache is old format (no full weights) — retraining")
         print(f"=== training seed {seed} ===", flush=True)
         eval_model, running_loss = train_one(seed, args, cfg, train_sub, device)
         m = {
@@ -300,14 +341,13 @@ def main():
             "val_bpb": evaluate_bpb(eval_model, val_ids, val_bytes,
                                     args.block_size, args.eval_batch_size, device),
         }
-        hid = {n: p.detach().float().cpu().clone()
-               for n, p in eval_model.named_parameters()
-               if p.ndim == 2 and "embed" not in n and "lm_head" not in n}
-        torch.save({"metrics": m, "hidden": hid}, ckpt_path)
+        sd = {k: v.detach().float().cpu().clone()
+              for k, v in eval_model.state_dict().items()}
+        torch.save({"metrics": m, "state_dict": sd}, ckpt_path)
         print(f"seed {seed}:  train {m['train_bpb']:.4f}  proxy {m['proxy_bpb']:.4f}  "
               f"val {m['val_bpb']:.4f} bpb", flush=True)
         metrics.append(m)
-        hiddens.append(hid)
+        state_dicts.append(sd)
         del eval_model
         if device == "mps":
             torch.mps.empty_cache()
@@ -330,6 +370,25 @@ def main():
     print("\n=== permutation p-values (two-sided, Pearson) ===")
     print(fmt_matrix(names, pvals))
 
+    print("\n=== pairwise KL divergence on val (EMA models) ===", flush=True)
+    kl_ids = val_ids if args.kl_bytes <= 0 else val_ids[:round(args.kl_bytes / bpt_val)]
+    models = []
+    for sd in state_dicts:
+        mdl = GPT(cfg).to(device)
+        mdl.load_state_dict(sd)
+        models.append(mdl)
+    kl_bits = kl_matrix(models, kl_ids, args.block_size, args.kl_batch_size,
+                        device) / math.log(2)
+    kl_sym = 0.5 * (kl_bits + kl_bits.T)
+    del models
+    n_kl_tok = len(kl_ids) // args.block_size * args.block_size
+    print(f"symmetrized KL, bits/token, over {n_kl_tok:,} val tokens:")
+    print(fmt_matrix([str(s) for s in seeds], kl_sym))
+    iu = np.triu_indices(len(seeds), 1)
+    print(f"mean pairwise sym-KL: {kl_sym[iu].mean():.4f} bits/token  "
+          f"(for scale: val bpb std across seeds is {cols['val_bpb'].std(ddof=1):.4f})")
+
+    hiddens = [hidden_from_sd(sd) for sd in state_dicts]
     print("\n=== spectral analysis of hidden matrices ===", flush=True)
     ratio, base_ratio, cos, base_cos, summ = spectral_analysis(hiddens, seeds)
     print(f"pairwise spectral-norm ratio  ||Wi-Wj||_2 / mean(||Wi||_2, ||Wj||_2), "
@@ -357,6 +416,7 @@ def main():
         "config": vars(args), "metrics": metrics,
         "pearson": pearson.tolist(), "spearman": spearman.tolist(),
         "pearson_perm_pvals": pvals.tolist(), "corr_names": names,
+        "kl_bits": kl_bits.tolist(), "kl_sym_bits": kl_sym.tolist(),
         "spectral_ratio": ratio.tolist(), "spectral_ratio_baseline": base_ratio.tolist(),
         "cosine": cos.tolist(), "cosine_baseline": base_cos.tolist(),
         "spectral_summary": summ, "verdict": verdict,
