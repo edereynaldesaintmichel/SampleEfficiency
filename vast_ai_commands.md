@@ -14,6 +14,12 @@ python eval.py runs/shak_v2048/best.pt --data data/shakespeare_v2048 --stride 12
 # python prepare_data.py --dataset shakespeare --vocab_size 256
 # python train.py --data data/shakespeare_v256 --run_name shak_v256 --steps 60000 --dropout 0.3 --weight_decay 0.25
 
+# --- generalization probe (10 seeds, 1MB train subset, 1000 steps each) ---
+# correlations across train/proxy/real-val bpb + pairwise spectral distances
+python prepare_data.py --dataset enwik8 --megabytes 10 --vocab_size 256
+python gen_probe.py --data data/enwik8_10mb_v256 --run_name gen_probe
+# results: runs/gen_probe/results.json (per-seed checkpoints cached, resumable)
+
 # --- enwik8 ---
 python prepare_data.py --dataset enwik8 --megabytes 10 --vocab_size 2048
 python train.py --data data/enwik8_10mb_v2048 --run_name best_v2048 --steps 100000
