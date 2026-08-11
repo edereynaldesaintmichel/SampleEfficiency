@@ -22,6 +22,7 @@ Example:
 """
 
 import argparse
+import contextlib
 import copy
 import json
 import math
@@ -72,6 +73,7 @@ def get_args():
     ap.add_argument("--eval_batch_size", type=int, default=16)
     ap.add_argument("--log_interval", type=int, default=100)
     ap.add_argument("--device", type=str, default="auto")
+    ap.add_argument("--no_amp", action="store_true", help="disable bf16 autocast (CUDA only)")
     ap.add_argument("--no_resume", action="store_true",
                     help="retrain even if a per-seed checkpoint exists in the run dir")
     return ap.parse_args()
@@ -85,6 +87,8 @@ def hidden_names(model: GPT) -> list[str]:
 def train_one(seed: int, args, cfg: GPTConfig, train_sub: np.ndarray, device: str):
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
+    amp_ctx = (torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+               if device == "cuda" and not args.no_amp else contextlib.nullcontext())
     model = GPT(cfg).to(device)
 
     hidden = [p for n, p in model.named_parameters()
@@ -119,7 +123,8 @@ def train_one(seed: int, args, cfg: GPTConfig, train_sub: np.ndarray, device: st
         ix = rng.integers(0, len(train_sub) - args.block_size - 1, size=args.batch_size)
         x = torch.stack([torch.from_numpy(train_sub[i:i + args.block_size].astype(np.int64)) for i in ix]).to(device)
         y = torch.stack([torch.from_numpy(train_sub[i + 1:i + 1 + args.block_size].astype(np.int64)) for i in ix]).to(device)
-        _, loss = model(x, y)
+        with amp_ctx:
+            _, loss = model(x, y)
         for opt in optimizers:
             opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -225,6 +230,7 @@ def spectral_analysis(hiddens: list[dict[str, torch.Tensor]], seeds: list[int]):
 def main():
     args = get_args()
     device = pick_device(args.device)
+    torch.set_float32_matmul_precision("high")  # TF32 on CUDA
     if device == "mps" and (args.attn_dropout if args.attn_dropout >= 0 else args.dropout) > 0:
         print("MPS: forcing attn_dropout=0 (fused SDPA)")
         args.attn_dropout = 0.0
