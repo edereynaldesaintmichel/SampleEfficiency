@@ -81,10 +81,13 @@ class EMA:
                        if v.dtype.is_floating_point}
 
     @torch.no_grad()
-    def update(self, model: torch.nn.Module):
+    def update(self, model: torch.nn.Module, step: int):
+        # decay warmup: horizon grows ~10 -> 1/(1-decay) steps, so the early
+        # EMA tracks the live weights instead of blending in the random init
+        d = min(self.decay, (1 + step) / (10 + step))
         for k, v in model.state_dict().items():
             if k in self.shadow:
-                self.shadow[k].lerp_(v.detach().float(), 1 - self.decay)
+                self.shadow[k].lerp_(v.detach().float(), 1 - d)
 
     def copy_to(self, model: torch.nn.Module):
         sd = model.state_dict()
@@ -201,7 +204,7 @@ def main():
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         for opt in optimizers:
             opt.step()
-        ema.update(model)
+        ema.update(model, step)
 
         l = loss.item()
         running_loss = l if running_loss is None else 0.99 * running_loss + 0.01 * l
@@ -222,10 +225,14 @@ def main():
             print(f"step {step:6d}  val bpb raw {bpb_raw:.4f}  ema {bpb_ema:.4f}", flush=True)
             with open(log_path, "a") as f:
                 f.write(f"{step},{m:.4f},{running_loss:.4f},,{bpb_raw:.4f},{bpb_ema:.4f},{time.time()-t0:.0f}\n")
-            if bpb_ema < best_bpb:
-                best_bpb = bpb_ema
-                torch.save({"model": eval_model.state_dict(), "config": cfg.__dict__,
-                            "step": step, "val_bpb": bpb_ema, "args": vars(args)},
+            which, cand_bpb, cand_model = (
+                ("ema", bpb_ema, eval_model) if bpb_ema <= bpb_raw else ("raw", bpb_raw, model)
+            )
+            if cand_bpb < best_bpb:
+                best_bpb = cand_bpb
+                torch.save({"model": cand_model.state_dict(), "config": cfg.__dict__,
+                            "step": step, "val_bpb": cand_bpb, "which": which,
+                            "args": vars(args)},
                            os.path.join(run_dir, "best.pt"))
             torch.save({"model": model.state_dict(), "ema": ema.shadow, "config": cfg.__dict__,
                         "step": step, "args": vars(args)},
