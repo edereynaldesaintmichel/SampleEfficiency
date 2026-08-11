@@ -5,8 +5,14 @@ on a small fixed corpus, with effectively unlimited compute?
 
 ## Protocol
 
-- **Corpus**: first 10 MB of enwik8, last 10% held out as a *contiguous* val chunk
-  (random windows would leak at byte level).
+- **Corpora**:
+  - *shakespeare* (primary): Complete Works (Gutenberg pg100, ~5.4 MB),
+    **work-level split** — val = Julius Caesar + As You Like It, test = Macbeth +
+    Twelfth Night, train = the other 39 works. Generalization here means
+    predicting unseen plays. Select checkpoints/hypers on val; touch test ONCE
+    at the end (`eval.py --split test`).
+  - *enwik8*: first 10 MB, last 10% held out as a *contiguous* val chunk
+    (random windows would leak at byte level).
 - **Metric**: bits per byte (bpb) over the val text — comparable across tokenizers,
   since bits are always divided by the same underlying byte count.
 - **Tokenizers**: byte-level (vocab=256) is the baseline; BPE variants are trained
@@ -25,8 +31,9 @@ on a small fixed corpus, with effectively unlimited compute?
 ```bash
 source .venv/bin/activate
 
-# data (byte-level baseline)
-python prepare_data.py --megabytes 10 --vocab_size 256
+# data (byte-level baselines)
+python prepare_data.py --dataset shakespeare --vocab_size 256
+python prepare_data.py --dataset enwik8 --megabytes 10 --vocab_size 256
 
 # vocab sweep variants (BPE trained on train split only)
 python prepare_data.py --megabytes 10 --vocab_size 512

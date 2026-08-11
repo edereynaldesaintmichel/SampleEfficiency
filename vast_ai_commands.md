@@ -1,6 +1,16 @@
 git clone https://github.com/edereynaldesaintmichel/SampleEfficiency.git
 cd SampleEfficiency
-pip install -r requirements.txt
-python prepare_data.py --megabytes 10 --vocab_size 256
-python train.py --data data/enwik8_10mb_v256 --run_name baseline
-python eval.py runs/baseline/best.pt --data data/enwik8_10mb_v256 --stride 128
+source /venv/main/bin/activate
+uv pip install tokenizers
+
+# --- shakespeare (primary) ---
+python prepare_data.py --dataset shakespeare --vocab_size 2048
+python train.py --data data/shakespeare_v2048 --run_name shak_v2048 --steps 60000 --dropout 0.3 --weight_decay 0.25
+python eval.py runs/shak_v2048/best.pt --data data/shakespeare_v2048 --stride 128
+# final report ONLY (never for selection):
+# python eval.py runs/shak_v2048/best.pt --data data/shakespeare_v2048 --stride 128 --split test
+
+# --- enwik8 ---
+python prepare_data.py --dataset enwik8 --megabytes 10 --vocab_size 2048
+python train.py --data data/enwik8_10mb_v2048 --run_name best_v2048 --steps 100000
+python eval.py runs/best_v2048/best.pt --data data/enwik8_10mb_v2048 --stride 128

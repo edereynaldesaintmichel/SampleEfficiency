@@ -23,6 +23,8 @@ def main():
     ap.add_argument("checkpoint", type=str)
     ap.add_argument("--data", type=str, default="data/enwik8_10mb_v256")
     ap.add_argument("--stride", type=int, default=128)
+    ap.add_argument("--split", type=str, default="val", choices=["val", "test"],
+                    help="test is for the final report only — never for selection")
     ap.add_argument("--batch_size", type=int, default=16)
     ap.add_argument("--device", type=str, default="auto")
     args = ap.parse_args()
@@ -36,14 +38,14 @@ def main():
     with open(os.path.join(args.data, "meta.json")) as f:
         meta = json.load(f)
     dtype = np.uint8 if meta["dtype"] == "uint8" else np.uint16
-    val_ids = torch.from_numpy(
-        np.fromfile(os.path.join(args.data, "val.bin"), dtype=dtype).astype(np.int64)
+    ids = torch.from_numpy(
+        np.fromfile(os.path.join(args.data, f"{args.split}.bin"), dtype=dtype).astype(np.int64)
     )
 
-    bpb = evaluate_bpb(model, val_ids, meta["val_bytes"], args.stride,
+    bpb = evaluate_bpb(model, ids, meta[f"{args.split}_bytes"], args.stride,
                        args.batch_size, device)
     print(f"{args.checkpoint} (step {ckpt.get('step','?')}): "
-          f"val bpb = {bpb:.4f}  [stride={args.stride}, block={cfg.block_size}]")
+          f"{args.split} bpb = {bpb:.4f}  [stride={args.stride}, block={cfg.block_size}]")
 
 
 if __name__ == "__main__":
