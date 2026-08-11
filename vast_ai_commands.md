@@ -14,8 +14,9 @@ python eval.py runs/shak_v2048/best.pt --data data/shakespeare_v2048 --stride 12
 # python prepare_data.py --dataset shakespeare --vocab_size 256
 # python train.py --data data/shakespeare_v256 --run_name shak_v256 --steps 60000 --dropout 0.3 --weight_decay 0.25
 
-# --- generalization probe (10 seeds, ~1MB-of-text train subset, 1000 steps each) ---
-# correlations across train/proxy/real-val bpb + pairwise spectral distances
+# --- generalization probe (10 gens, ~1MB-of-text train subset, 1000 steps each) ---
+# shared init (--init_seed); per-gen noise = data order + dropout masks only
+# correlations across train/proxy/real-val bpb + pairwise spectral/KL distances + ensemble
 git pull
 python gen_probe.py --data data/shakespeare_v2048 --run_name gen_probe
 # results: runs/gen_probe/results.json (per-seed checkpoints cached, resumable)

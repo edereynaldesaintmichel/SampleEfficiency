@@ -1,8 +1,11 @@
 """Probe: is a model's generalization ability itself generalizable?
 
-Trains N seeds of the transformer on a small fixed subset of train.bin
+Trains N gens of the transformer on a small fixed subset of train.bin
 (default: first 1MB), 1000 steps each, small weight decay, EMA weights used
-for all measurements. For each seed measures:
+for all measurements. All gens start from the SAME initialization
+(--init_seed); the per-gen seed only drives data sampling (batch order) and
+dropout masks, so the spread across gens is purely optimization-path noise,
+not init noise. For each gen measures:
 
   train_bpb  - bpb on a slice the model trained on (first 100KB of the subset)
   proxy_bpb  - bpb on the next 100KB of train.bin (same distribution, never seen)
@@ -49,6 +52,9 @@ def get_args():
     # experiment
     ap.add_argument("--n_seeds", type=int, default=10)
     ap.add_argument("--seed0", type=int, default=0)
+    ap.add_argument("--init_seed", type=int, default=1337,
+                    help="seed for model init, shared by ALL gens; per-gen seeds "
+                         "only affect data sampling and dropout masks")
     ap.add_argument("--train_bytes", type=int, default=1_000_000)
     ap.add_argument("--proxy_bytes", type=int, default=100_000)
     ap.add_argument("--train_eval_bytes", type=int, default=100_000)
@@ -92,11 +98,12 @@ def hidden_names(model: GPT) -> list[str]:
 
 
 def train_one(seed: int, args, cfg: GPTConfig, train_sub: np.ndarray, device: str):
-    torch.manual_seed(seed)
-    rng = np.random.default_rng(seed)
+    rng = np.random.default_rng(seed)  # data sampling: the per-gen noise source
     amp_ctx = (torch.autocast(device_type="cuda", dtype=torch.bfloat16)
                if device == "cuda" and not args.no_amp else contextlib.nullcontext())
+    torch.manual_seed(args.init_seed)  # identical init across gens
     model = GPT(cfg).to(device)
+    torch.manual_seed(seed)  # per-gen dropout masks
 
     hidden = [p for n, p in model.named_parameters()
               if p.ndim == 2 and "embed" not in n and "lm_head" not in n]
@@ -336,7 +343,8 @@ def main():
         json.dump(vars(args), f, indent=2)
 
     seeds = [args.seed0 + k for k in range(args.n_seeds)]
-    print(f"device={device}  seeds={seeds}")
+    print(f"device={device}  seeds={seeds}  init_seed={args.init_seed} (shared: "
+          f"only data order + dropout masks differ across gens)")
     print(f"vocab={meta['vocab_size']}  bytes/token train={bpt_train:.3f}")
     print(f"train subset: {len(train_sub):,} tok (~{args.train_bytes:,}B)  "
           f"proxy: {len(proxy_ids):,} tok (~{args.proxy_bytes:,}B)  "
@@ -349,12 +357,12 @@ def main():
         ckpt_path = os.path.join(run_dir, f"seed{seed}.pt")
         if os.path.exists(ckpt_path) and not args.no_resume:
             ck = torch.load(ckpt_path, map_location="cpu", weights_only=True)
-            if "state_dict" in ck:
+            if "state_dict" in ck and ck.get("init_seed") == args.init_seed:
                 print(f"seed {seed}: loaded cached result")
                 metrics.append(ck["metrics"])
                 state_dicts.append(ck["state_dict"])
                 continue
-            print(f"seed {seed}: cache is old format (no full weights) — retraining")
+            print(f"seed {seed}: cache is old format or init_seed mismatch — retraining")
         print(f"=== training seed {seed} ===", flush=True)
         eval_model, running_loss = train_one(seed, args, cfg, train_sub, device)
         m = {
@@ -369,7 +377,8 @@ def main():
         }
         sd = {k: v.detach().float().cpu().clone()
               for k, v in eval_model.state_dict().items()}
-        torch.save({"metrics": m, "state_dict": sd}, ckpt_path)
+        torch.save({"metrics": m, "state_dict": sd, "init_seed": args.init_seed},
+                   ckpt_path)
         print(f"seed {seed}:  train {m['train_bpb']:.4f}  proxy {m['proxy_bpb']:.4f}  "
               f"val {m['val_bpb']:.4f} bpb", flush=True)
         metrics.append(m)
