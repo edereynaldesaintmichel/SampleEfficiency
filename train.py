@@ -55,6 +55,8 @@ def get_args():
     ap.add_argument("--eval_stride", type=int, default=-1, help="-1 = block_size (fast interim eval); smaller = more context")
     ap.add_argument("--eval_batch_size", type=int, default=16)
     ap.add_argument("--log_interval", type=int, default=50)
+    ap.add_argument("--quick_eval_batches", type=int, default=4,
+                    help="random val batches for the cheap val estimate printed every log_interval")
     ap.add_argument("--seed", type=int, default=1337)
     ap.add_argument("--device", type=str, default="auto")
     ap.add_argument("--no_amp", action="store_true", help="disable bf16 autocast (CUDA only; evals always run fp32)")
@@ -154,13 +156,30 @@ def main():
     ema = EMA(model, args.ema_decay)
     eval_model = copy.deepcopy(model)  # holds EMA weights during eval
 
+    nats_to_bpb = (meta["val_tokens"] / meta["val_bytes"]) / math.log(2)
+
+    @torch.no_grad()
+    def quick_val_bpb() -> float:
+        """Cheap val estimate: mean loss over a few random val windows -> approx bpb."""
+        model.eval()
+        total, n = 0.0, 0
+        for _ in range(args.quick_eval_batches):
+            ix = np.random.randint(0, len(val_ids) - args.block_size - 1, size=args.eval_batch_size)
+            x = torch.stack([val_ids[i:i + args.block_size] for i in ix]).to(device)
+            y = torch.stack([val_ids[i + 1:i + 1 + args.block_size] for i in ix]).to(device)
+            _, loss = model(x, y)
+            total += loss.item()
+            n += 1
+        model.train()
+        return total / n * nats_to_bpb
+
     run_dir = os.path.join(args.out_dir, args.run_name)
     os.makedirs(run_dir, exist_ok=True)
     with open(os.path.join(run_dir, "config.json"), "w") as f:
         json.dump(vars(args) | {"params": model.num_params()}, f, indent=2)
     log_path = os.path.join(run_dir, "log.csv")
     with open(log_path, "w") as f:
-        f.write("step,lr_mult,train_loss,val_bpb_raw,val_bpb_ema,time_s\n")
+        f.write("step,lr_mult,train_loss,quick_val_bpb,val_bpb_raw,val_bpb_ema,time_s\n")
 
     best_bpb = float("inf")
     t0 = time.time()
@@ -187,7 +206,11 @@ def main():
         l = loss.item()
         running_loss = l if running_loss is None else 0.99 * running_loss + 0.01 * l
         if step % args.log_interval == 0:
-            print(f"step {step:6d}  loss {running_loss:.4f}  lr x{m:.3f}  {time.time()-t0:.0f}s")
+            qbpb = quick_val_bpb()
+            print(f"step {step:6d}  loss {running_loss:.4f}  val~bpb {qbpb:.4f}  "
+                  f"lr x{m:.3f}  {time.time()-t0:.0f}s", flush=True)
+            with open(log_path, "a") as f:
+                f.write(f"{step},{m:.4f},{running_loss:.4f},{qbpb:.4f},,,{time.time()-t0:.0f}\n")
 
         if (step + 1) % args.eval_interval == 0 or step == args.steps - 1:
             bpb_raw = evaluate_bpb(model, val_ids, meta["val_bytes"], args.eval_stride,
@@ -196,9 +219,9 @@ def main():
             ema.copy_to(eval_model)
             bpb_ema = evaluate_bpb(eval_model, val_ids, meta["val_bytes"], args.eval_stride,
                                    args.eval_batch_size, device)
-            print(f"step {step:6d}  val bpb raw {bpb_raw:.4f}  ema {bpb_ema:.4f}")
+            print(f"step {step:6d}  val bpb raw {bpb_raw:.4f}  ema {bpb_ema:.4f}", flush=True)
             with open(log_path, "a") as f:
-                f.write(f"{step},{m:.4f},{running_loss:.4f},{bpb_raw:.4f},{bpb_ema:.4f},{time.time()-t0:.0f}\n")
+                f.write(f"{step},{m:.4f},{running_loss:.4f},,{bpb_raw:.4f},{bpb_ema:.4f},{time.time()-t0:.0f}\n")
             if bpb_ema < best_bpb:
                 best_bpb = bpb_ema
                 torch.save({"model": eval_model.state_dict(), "config": cfg.__dict__,
