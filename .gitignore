@@ -3,4 +3,4 @@ data/
 runs/
 __pycache__/
 *.pt
-probe_plots/
+probe_plots*/
