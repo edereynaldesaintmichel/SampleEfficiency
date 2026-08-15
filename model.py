@@ -23,6 +23,7 @@ class GPTConfig:
     dropout: float = 0.2
     attn_dropout: float = -1.0  # dropout on the attention matrix; -1 = same as dropout
     softcap: float = 30.0  # 0 disables
+    loops: int = 1  # apply each block this many times (weight-shared depth)
 
 
 class Rotary(nn.Module):
@@ -104,6 +105,7 @@ class GPT(nn.Module):
     def __init__(self, cfg: GPTConfig):
         super().__init__()
         self.cfg = cfg
+        self.loops = None  # runtime override for cfg.loops; set via set_loops()
         self.embed = nn.Embedding(cfg.vocab_size, cfg.n_embd)
         nn.init.normal_(self.embed.weight, std=0.02)
         self.embed_drop = nn.Dropout(cfg.dropout)
@@ -119,11 +121,17 @@ class GPT(nn.Module):
     def num_params(self) -> int:
         return sum(p.numel() for p in self.parameters())
 
+    def set_loops(self, k: int | None):
+        """Loop count for subsequent forwards (None = fall back to cfg.loops)."""
+        self.loops = k
+
     def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None,
                 loss_reduction: str = "mean"):
+        k = self.loops if self.loops is not None else self.cfg.loops
         x = self.embed_drop(self.embed(idx))
         for block in self.blocks:
-            x = block(x)
+            for _ in range(k):
+                x = block(x)
         x = self.norm_f(x)
         logits = self.lm_head(x)
         if self.cfg.softcap > 0:
