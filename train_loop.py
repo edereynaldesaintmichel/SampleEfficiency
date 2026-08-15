@@ -53,6 +53,8 @@ def get_args():
     # optimization
     ap.add_argument("--steps", type=int, default=50000)
     ap.add_argument("--batch_size", type=int, default=32)
+    ap.add_argument("--grad_accum", type=int, default=1,
+                    help="split each batch into this many micro-batches (same effective batch, less memory)")
     ap.add_argument("--muon_lr", type=float, default=0.02)
     ap.add_argument("--muon_momentum", type=float, default=0.95)
     ap.add_argument("--adam_lr", type=float, default=3e-3)
@@ -199,18 +201,25 @@ def main():
 
         model.set_loops(int(np.random.choice(train_loops)))
         x, y = get_batch()
-        with amp_ctx:
-            _, loss = model(x, y)
         for opt in optimizers:
             opt.zero_grad(set_to_none=True)
-        loss.backward()
+        micro = max(1, args.grad_accum)
+        mb = x.size(0) // micro
+        loss_sum = 0.0
+        for i in range(micro):
+            xm, ym = x[i * mb:(i + 1) * mb], y[i * mb:(i + 1) * mb]
+            with amp_ctx:
+                _, loss = model(xm, ym)
+            (loss / micro).backward()
+            loss_sum += loss.item()
+        loss = None
         if args.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         for opt in optimizers:
             opt.step()
         ema.update(model, step)
 
-        l = loss.item()
+        l = loss_sum / micro
         running_loss = l if running_loss is None else 0.99 * running_loss + 0.01 * l
         if step % args.log_interval == 0:
             ts = probe_train_loss(x, y)
