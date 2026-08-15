@@ -146,6 +146,19 @@ def main():
     nats_to_bpb = (meta["val_tokens"] / meta["val_bytes"]) / math.log(2)
 
     @torch.no_grad()
+    def probe_train_loss(x, y) -> list[float]:
+        """Paired depth comparison: loss of the SAME batch at every eval depth,
+        dropout off, so the l1-vs-l4 gap isn't confounded by batch/mask noise."""
+        model.eval()
+        out = []
+        for k in eval_loops:
+            model.set_loops(k)
+            _, loss = model(x, y)
+            out.append(loss.item())
+        model.train()
+        return out
+
+    @torch.no_grad()
     def quick_val_bpb(k: int) -> float:
         """Cheap val estimate at depth k: mean loss over a few random val windows."""
         model.eval()
@@ -166,11 +179,12 @@ def main():
     with open(os.path.join(run_dir, "config.json"), "w") as f:
         json.dump(vars(args) | {"params": model.num_params()}, f, indent=2)
     log_path = os.path.join(run_dir, "log.csv")
+    t_cols = ",".join(f"train_loss_l{k}" for k in eval_loops)
     q_cols = ",".join(f"quick_val_bpb_l{k}" for k in eval_loops)
     r_cols = ",".join(f"val_bpb_raw_l{k}" for k in eval_loops)
     e_cols = ",".join(f"val_bpb_ema_l{k}" for k in eval_loops)
     with open(log_path, "w") as f:
-        f.write(f"step,lr_mult,train_loss,{q_cols},{r_cols},{e_cols},time_s\n")
+        f.write(f"step,lr_mult,train_loss,{t_cols},{q_cols},{r_cols},{e_cols},time_s\n")
     n_depths = len(eval_loops)
 
     best_bpb = float("inf")
@@ -199,12 +213,16 @@ def main():
         l = loss.item()
         running_loss = l if running_loss is None else 0.99 * running_loss + 0.01 * l
         if step % args.log_interval == 0:
+            ts = probe_train_loss(x, y)
             qs = [quick_val_bpb(k) for k in eval_loops]
+            tstr = "  ".join(f"l{k} {t:.3f}" for k, t in zip(eval_loops, ts))
             qstr = "  ".join(f"l{k} {q:.3f}" for k, q in zip(eval_loops, qs))
-            print(f"step {step:6d}  loss {running_loss:.4f}  val~bpb [{qstr}]  "
-                  f"lr x{m:.3f}  {time.time()-t0:.0f}s", flush=True)
+            print(f"step {step:6d}  loss {running_loss:.4f}  "
+                  f"train [{tstr}]  gap l{eval_loops[0]}-l{eval_loops[-1]} {ts[0]-ts[-1]:+.4f}  "
+                  f"val~bpb [{qstr}]  lr x{m:.3f}  {time.time()-t0:.0f}s", flush=True)
             with open(log_path, "a") as f:
                 f.write(f"{step},{m:.4f},{running_loss:.4f},"
+                        + ",".join(f"{t:.4f}" for t in ts) + ","
                         + ",".join(f"{q:.4f}" for q in qs)
                         + "," * (2 * n_depths) + f",{time.time()-t0:.0f}\n")
 
@@ -224,7 +242,7 @@ def main():
             print(f"step {step:6d}  val bpb raw [{rstr}]", flush=True)
             print(f"step {step:6d}  val bpb ema [{estr}]", flush=True)
             with open(log_path, "a") as f:
-                f.write(f"{step},{m:.4f},{running_loss:.4f}," + "," * n_depths
+                f.write(f"{step},{m:.4f},{running_loss:.4f}," + "," * (2 * n_depths)
                         + ",".join(f"{b:.4f}" for b in raws) + ","
                         + ",".join(f"{b:.4f}" for b in emas)
                         + f",{time.time()-t0:.0f}\n")
