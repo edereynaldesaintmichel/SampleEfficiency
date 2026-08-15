@@ -301,22 +301,29 @@ class DirectionalWarp(nn.Module):
             self.slopes[j] = torch.lerp(self.slopes[j], tgt, self.alpha)
             self.slopes[j] /= self.slopes[j].mean()                # exact range preservation
 
-        # selection: keep the best --warp_pool of {eligible actives + candidates}
+        # selection: keep the best --warp_pool of {eligible actives + candidates}.
+        # A slot is only retired if its replacement candidate actually gets a
+        # free slot (retiring slots occupy theirs while fading), so the pool
+        # never bleeds below --warp_pool waiting for fades to finish.
         n_c = Dm.shape[0] - na
         if n_c > 0:
             eligible = [int(j) for j in act_idx.tolist() if int(self.age[j]) >= self.min_age]
-            capacity = self.pool - (n_active - len(eligible))
+            capacity = max(self.pool - (n_active - len(eligible)), 0)
             entries = ([(float(self.score[j]), "slot", j) for j in eligible]
                        + [(float(counts[na + c]), "cand", c) for c in range(n_c)])
             entries.sort(key=lambda e: -e[0])
-            for sc, kind, j in entries[max(capacity, 0):]:
-                if kind == "slot":
-                    self.active[j] = False
-                    self.retiring[j] = True
-                    self.turnover += 1
-            for sc, kind, c in entries[:max(capacity, 0)]:
-                if kind == "cand":
-                    self._admit(cand[c], float(qlo[na + c]), float(qhi[na + c]), sc)
+            kept, dropped = entries[:capacity], entries[capacity:]
+            cand_kept = [e for e in kept if e[1] == "cand"]          # desc score
+            slots_dropped = [e for e in dropped if e[1] == "slot"]   # desc score
+            free_now = int(((self.fade <= 0) & ~self.active & ~self.retiring).sum())
+            n_admit = min(len(cand_kept), free_now)
+            n_rescue = min(len(cand_kept) - n_admit, len(slots_dropped))
+            for sc, kind, j in slots_dropped[n_rescue:]:
+                self.active[j] = False
+                self.retiring[j] = True
+                self.turnover += 1
+            for sc, kind, c in cand_kept[:n_admit]:
+                self._admit(cand[c], float(qlo[na + c]), float(qhi[na + c]), sc)
 
         self._advance_fades()
         self._refresh_cum()
