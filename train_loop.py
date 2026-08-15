@@ -75,6 +75,8 @@ def get_args():
     ap.add_argument("--device", type=str, default="auto")
     ap.add_argument("--no_amp", action="store_true", help="disable bf16 autocast (CUDA only; evals always run fp32)")
     ap.add_argument("--compile", action="store_true")
+    ap.add_argument("--init_from", type=str, default="",
+                    help="checkpoint to load model weights from (fresh optimizers/EMA/schedule)")
     return ap.parse_args()
 
 
@@ -108,6 +110,11 @@ def main():
         print("WARNING: attn dropout > 0 on MPS forces unfused attention and will "
               "likely OOM — pass --attn_dropout 0 for local runs.")
     model = GPT(cfg).to(device)
+    if args.init_from:
+        ckpt = torch.load(args.init_from, map_location="cpu", weights_only=False)
+        model.load_state_dict(ckpt["model"])
+        print(f"init from {args.init_from} (step {ckpt.get('step')}, "
+              f"val_bpb {ckpt.get('val_bpb')}, {ckpt.get('which')}, loops={ckpt.get('loops')})")
     if args.compile:
         model = torch.compile(model)
     print(f"device={device}  params={model.num_params()/1e6:.2f}M  vocab={cfg.vocab_size}  "
