@@ -106,6 +106,7 @@ class GPT(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.loops = None  # runtime override for cfg.loops; set via set_loops()
+        self.layer_seq = None  # explicit block-index program; overrides loops when set
         self.embed = nn.Embedding(cfg.vocab_size, cfg.n_embd)
         nn.init.normal_(self.embed.weight, std=0.02)
         self.embed_drop = nn.Dropout(cfg.dropout)
@@ -125,13 +126,22 @@ class GPT(nn.Module):
         """Loop count for subsequent forwards (None = fall back to cfg.loops)."""
         self.loops = k
 
+    def set_layer_seq(self, seq: list[int] | None):
+        """Run blocks in this exact order (with repeats) instead of the loop
+        schedule, e.g. [3, 0, 0, 7] applies block 3, block 0 twice, block 7."""
+        self.layer_seq = seq
+
     def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None,
                 loss_reduction: str = "mean"):
         k = self.loops if self.loops is not None else self.cfg.loops
         x = self.embed_drop(self.embed(idx))
-        for block in self.blocks:
-            for _ in range(k):
-                x = block(x)
+        if self.layer_seq is not None:
+            for i in self.layer_seq:
+                x = self.blocks[i](x)
+        else:
+            for block in self.blocks:
+                for _ in range(k):
+                    x = block(x)
         x = self.norm_f(x)
         logits = self.lm_head(x)
         if self.cfg.softcap > 0:
