@@ -64,6 +64,10 @@ def get_args():
     ap.add_argument("--grad_clip", type=float, default=1.0)
     # regularization / averaging
     ap.add_argument("--ema_decay", type=float, default=0.999)
+    ap.add_argument("--ce_floor", type=float, default=0.0,
+                    help="per-token loss floor in nats: tokens with CE below this get zero "
+                         "gradient (per-token flooding). 0 = plain CE. Normalization stays "
+                         "sum/total-tokens so easy tokens are dropped, not hard ones up-weighted.")
     # eval
     ap.add_argument("--eval_interval", type=int, default=1000)
     ap.add_argument("--eval_stride", type=int, default=-1, help="-1 = block_size (fast interim eval); smaller = more context")
@@ -208,6 +212,7 @@ def main():
     best_bpb = float("inf")
     t0 = time.time()
     running_loss = None
+    running_gate = None
 
     for step in range(args.steps):
         m = lr_mult(step)
@@ -223,12 +228,20 @@ def main():
         micro = max(1, args.grad_accum)
         mb = x.size(0) // micro
         loss_sum = 0.0
+        gated_sum = 0.0
         for i in range(micro):
             xm, ym = x[i * mb:(i + 1) * mb], y[i * mb:(i + 1) * mb]
             with amp_ctx:
-                _, loss = model(xm, ym)
+                if args.ce_floor > 0:
+                    _, lt = model(xm, ym, loss_reduction="none")
+                    keep = (lt.detach() > args.ce_floor).float()
+                    loss = (lt * keep).sum() / lt.numel()
+                    loss_sum += lt.detach().mean().item()  # log plain CE, comparable across runs
+                    gated_sum += 1.0 - keep.mean().item()
+                else:
+                    _, loss = model(xm, ym)
+                    loss_sum += loss.item()
             (loss / micro).backward()
-            loss_sum += loss.item()
         loss = None
         if args.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
@@ -239,12 +252,15 @@ def main():
 
         l = loss_sum / micro
         running_loss = l if running_loss is None else 0.99 * running_loss + 0.01 * l
+        g = gated_sum / micro
+        running_gate = g if running_gate is None else 0.99 * running_gate + 0.01 * g
         if step % args.log_interval == 0:
             ts = probe_train_loss(x, y)
             qs = [quick_val_bpb(seq) for _, seq in eval_cfgs]
             tstr = "  ".join(f"{n} {t:.3f}" for n, t in zip(names, ts))
             qstr = "  ".join(f"{n} {q:.3f}" for n, q in zip(names, qs))
-            print(f"step {step:6d}  loss {running_loss:.4f}  d{depth:2d}  "
+            gstr = f"  gate {running_gate:.2f}" if args.ce_floor > 0 else ""
+            print(f"step {step:6d}  loss {running_loss:.4f}{gstr}  d{depth:2d}  "
                   f"train [{tstr}]  val~bpb [{qstr}]  lr x{m:.3f}  {time.time()-t0:.0f}s", flush=True)
             with open(log_path, "a") as f:
                 f.write(f"{step},{m:.4f},{running_loss:.4f},"
