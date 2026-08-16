@@ -68,6 +68,13 @@ def get_args():
                     help="per-token loss floor in nats: tokens with CE below this get zero "
                          "gradient (per-token flooding). 0 = plain CE. Normalization stays "
                          "sum/total-tokens so easy tokens are dropped, not hard ones up-weighted.")
+    ap.add_argument("--ce_pow", type=float, default=1.0,
+                    help="train on (CE + eps)^p per token instead of CE. p<1 is concave: "
+                         "gradient weight p*(CE+eps)^(p-1) UP-weights easy tokens and shrinks "
+                         "the signal from rare/hard ones (anti-focal). 1 = plain CE.")
+    ap.add_argument("--ce_pow_eps", type=float, default=0.01,
+                    help="epsilon inside the power transform; caps the CE->0 gradient blowup "
+                         "at p*eps^(p-1) (~5x for p=0.5, eps=0.01)")
     # eval
     ap.add_argument("--eval_interval", type=int, default=1000)
     ap.add_argument("--eval_stride", type=int, default=-1, help="-1 = block_size (fast interim eval); smaller = more context")
@@ -86,6 +93,8 @@ def get_args():
 
 def main():
     args = get_args()
+    if args.ce_floor > 0 and args.ce_pow != 1.0:
+        raise SystemExit("--ce_floor and --ce_pow are separate experiments; set only one")
     device = pick_device(args.device)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -232,12 +241,15 @@ def main():
         for i in range(micro):
             xm, ym = x[i * mb:(i + 1) * mb], y[i * mb:(i + 1) * mb]
             with amp_ctx:
-                if args.ce_floor > 0:
+                if args.ce_floor > 0 or args.ce_pow != 1.0:
                     _, lt = model(xm, ym, loss_reduction="none")
-                    keep = (lt.detach() > args.ce_floor).float()
-                    loss = (lt * keep).sum() / lt.numel()
                     loss_sum += lt.detach().mean().item()  # log plain CE, comparable across runs
-                    gated_sum += 1.0 - keep.mean().item()
+                    if args.ce_floor > 0:
+                        keep = (lt.detach() > args.ce_floor).float()
+                        loss = (lt * keep).sum() / lt.numel()
+                        gated_sum += 1.0 - keep.mean().item()
+                    else:
+                        loss = ((lt + args.ce_pow_eps) ** args.ce_pow).mean()
                 else:
                     _, loss = model(xm, ym)
                     loss_sum += loss.item()
