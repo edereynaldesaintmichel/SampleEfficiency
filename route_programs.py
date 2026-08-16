@@ -14,6 +14,11 @@ All routers output log-weights; loss is the weighted-mixture NLL
   -log sum_i w_i exp(-nll_i),
 so uniform weights are the guaranteed starting point (final layers zero-init).
 
+--val_ab replaces the train->val protocol with the honest fallback for when
+train-split routers don't transfer (the base model has memorized train, so
+program stats there are distorted): train on one contiguous half of val,
+report on the other, both directions, clearly labeled.
+
 Example:
   python route_programs.py --dump_dir runs/shak_shuffle_5M_20k/routing
 """
@@ -104,23 +109,80 @@ def train_router(mode, Xtr, ptr, ntr, Xho, pho, nho, vocab, device,
     return r, best_ho, epoch + 1
 
 
+def slice_dump(d: dict, lo: int, hi: int) -> dict:
+    N = d["nll"].size(0)
+    out = {k: d[k][lo:hi] for k in ("nll", "ent", "lmp", "top1", "prev_id")}
+    out["n_bytes"] = d["n_bytes"] * (hi - lo) / N  # approximate
+    out["programs"] = d["programs"]
+    return out
+
+
+def stage1(tr: dict, va: dict, holdout_frac: float, device: str, label: str):
+    """Train routers on `tr`, report on `va`. Returns (best_bpb, mode, router, mu, sd)."""
+    K = tr["nll"].size(1)
+    B = va["n_bytes"]
+    nv = va["nll"]
+    Xtr_all, Xva = build_features(tr), build_features(va)
+    mu, sd = Xtr_all.mean(0, keepdim=True), Xtr_all.std(0, keepdim=True).clamp_min(1e-4)
+    Xtr_all, Xva = (Xtr_all - mu) / sd, (Xva - mu) / sd
+    cut = Xtr_all.size(0) - int(Xtr_all.size(0) * holdout_frac)
+    vocab = int(max(tr["prev_id"].max(), va["prev_id"].max())) + 1
+
+    to = lambda t: t.to(device)
+    Xtr, ptr, ntr = to(Xtr_all[:cut]), to(tr["prev_id"][:cut].long()), to(tr["nll"][:cut])
+    Xho, pho = to(Xtr_all[cut:]), to(tr["prev_id"][cut:].long())
+    nho = tr["nll"][cut:]
+    Xva_d, pva = to(Xva), to(va["prev_id"].long())
+
+    uni_ho = float(uniform_mix(nho).mean())
+    uni_val = bpb(float(uniform_mix(nv).sum()), B)
+    print(f"--- {label} ---")
+    print(f"{'variant':10s}  {'fit-ho nats':>11s}  {'report bpb':>10s}")
+    print(f"{'uniform':10s}  {uni_ho:11.4f}  {uni_val:10.4f}")
+
+    # entropy weighting: alpha picked on the fit holdout
+    best_alpha, best_ho = 0.0, uni_ho
+    for alpha in (0.125, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0):
+        logw = F.log_softmax(-alpha * tr["ent"][cut:].float(), dim=1)
+        ho = float(weighted_mix(nho, logw).mean())
+        if ho < best_ho:
+            best_alpha, best_ho = alpha, ho
+    v = bpb(float(weighted_mix(nv, F.log_softmax(-best_alpha * va["ent"].float(), dim=1)).sum()), B)
+    print(f"{'entropy':10s}  {best_ho:11.4f}  {v:10.4f}   (alpha={best_alpha})")
+
+    best = (uni_val, "uniform", None)
+    for mode in ("static", "mlp", "mlp+prev"):
+        r, ho, ep = train_router(mode, Xtr, ptr, ntr, Xho, pho, nho, vocab, device)
+        with torch.no_grad():
+            logw_val = r(Xva_d, pva).cpu()
+        v = bpb(float(weighted_mix(nv, logw_val).sum()), B)
+        with torch.no_grad():
+            w_ent = float((-(logw_val.exp() * logw_val).sum(1)).mean())
+            agree = float((logw_val.argmax(1) == nv.argmin(1)).float().mean())
+        print(f"{mode:10s}  {ho:11.4f}  {v:10.4f}   (epochs {ep}, weight-H {w_ent:.2f}/{math.log(K):.2f}, "
+              f"argmax=oracle {100 * agree:.1f}%)")
+        if v < best[0]:
+            best = (v, mode, r)
+    print(f"best: {best[1]}  report bpb {best[0]:.4f}  (uniform {uni_val:.4f}, "
+          f"oracle {bpb(float(nv.double().min(dim=1).values.sum()), B):.4f})\n")
+    return best + (mu, sd)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dump_dir", type=str, required=True)
-    ap.add_argument("--holdout_frac", type=float, default=0.05, help="tail of train, for early stopping")
+    ap.add_argument("--holdout_frac", type=float, default=0.05, help="tail of the fit split, for early stopping")
+    ap.add_argument("--val_ab", action="store_true", help="fit on val half A, report on half B (both directions) instead of train->val")
     ap.add_argument("--device", type=str, default="auto")
     ap.add_argument("--save_router", type=str, default="", help="optional path for the best router")
     args = ap.parse_args()
     device = pick_device(args.device)
 
-    tr = torch.load(os.path.join(args.dump_dir, "train.pt"), weights_only=False)
     va = torch.load(os.path.join(args.dump_dir, "val.pt"), weights_only=False)
-    assert tr["programs"] == va["programs"]
-    K = tr["nll"].size(1)
+    K = va["nll"].size(1)
     B = va["n_bytes"]
     nv = va["nll"]
-    print(f"K={K} programs (depths {[len(p) for p in tr['programs']]})  "
-          f"train {tr['nll'].size(0)} tokens, val {nv.size(0)} tokens\n")
+    print(f"K={K} programs (depths {[len(p) for p in va['programs']]})  val {nv.size(0)} tokens\n")
 
     # ---------------- Stage 0 ----------------
     singles = np.array([bpb(float(nv[:, i].double().sum()), B) for i in range(K)])
@@ -139,54 +201,20 @@ def main():
     print(f"per-token (uniform - oracle) nats: median {q[0]:.3f}  p90 {q[1]:.3f}  p99 {q[2]:.3f}\n")
 
     # ---------------- Stage 1 ----------------
-    Xtr_all, Xva = build_features(tr), build_features(va)
-    mu, sd = Xtr_all.mean(0, keepdim=True), Xtr_all.std(0, keepdim=True).clamp_min(1e-4)
-    Xtr_all, Xva = (Xtr_all - mu) / sd, (Xva - mu) / sd
-    n_ho = int(Xtr_all.size(0) * args.holdout_frac)
-    cut = Xtr_all.size(0) - n_ho
-    vocab = int(max(tr["prev_id"].max(), va["prev_id"].max())) + 1
+    if args.val_ab:
+        mid = nv.size(0) // 2
+        A, Bd = slice_dump(va, 0, mid), slice_dump(va, mid, nv.size(0))
+        r1 = stage1(A, Bd, args.holdout_frac, device, "fit val-A -> report val-B")
+        r2 = stage1(Bd, A, args.holdout_frac, device, "fit val-B -> report val-A")
+        best = min(r1, r2, key=lambda r: r[0])
+    else:
+        tr = torch.load(os.path.join(args.dump_dir, "train.pt"), weights_only=False)
+        assert tr["programs"] == va["programs"]
+        best = stage1(tr, va, args.holdout_frac, device, "fit train -> report val")
 
-    to = lambda t: t.to(device)
-    Xtr, ptr, ntr = to(Xtr_all[:cut]), to(tr["prev_id"][:cut].long()), to(tr["nll"][:cut])
-    Xho, pho = to(Xtr_all[cut:]), to(tr["prev_id"][cut:].long())
-    nho = tr["nll"][cut:]
-    Xva_d, pva = to(Xva), to(va["prev_id"].long())
-
-    uni_ho = float(uniform_mix(nho).mean())
-    uni_val = bpb(float(uniform_mix(nv).sum()), B)
-    print(f"{'variant':10s}  {'train-ho nats':>13s}  {'val bpb':>8s}")
-    print(f"{'uniform':10s}  {uni_ho:13.4f}  {uni_val:8.4f}")
-
-    # entropy weighting: alpha picked on the train holdout
-    ent_tr, ent_va = tr["ent"].float(), va["ent"].float()
-    best_alpha, best_ho = 0.0, uni_ho
-    for alpha in (0.125, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0):
-        logw = F.log_softmax(-alpha * ent_tr[cut:], dim=1)
-        ho = float(weighted_mix(nho, logw).mean())
-        if ho < best_ho:
-            best_alpha, best_ho = alpha, ho
-    v = bpb(float(weighted_mix(nv, F.log_softmax(-best_alpha * ent_va, dim=1)).sum()), B)
-    print(f"{'entropy':10s}  {best_ho:13.4f}  {v:8.4f}   (alpha={best_alpha})")
-
-    best = (uni_val, "uniform", None)
-    for mode in ("static", "mlp", "mlp+prev"):
-        r, ho, ep = train_router(mode, Xtr, ptr, ntr, Xho, pho, nho, vocab, device)
-        with torch.no_grad():
-            logw_val = r(Xva_d, pva).cpu()
-        v = bpb(float(weighted_mix(nv, logw_val).sum()), B)
-        with torch.no_grad():
-            w_ent = float((-(logw_val.exp() * logw_val).sum(1)).mean())
-            agree = float((logw_val.argmax(1) == nv.argmin(1)).float().mean())
-        print(f"{mode:10s}  {ho:13.4f}  {v:8.4f}   (epochs {ep}, weight-H {w_ent:.2f}/{math.log(K):.2f}, "
-              f"argmax=oracle {100 * agree:.1f}%)")
-        if v < best[0]:
-            best = (v, mode, r)
-
-    print(f"\nbest: {best[1]}  val bpb {best[0]:.4f}  (uniform {uni_val:.4f}, "
-          f"oracle {bpb(float(nv.double().min(dim=1).values.sum()), B):.4f})")
     if args.save_router and best[2] is not None:
-        torch.save({"state": best[2].state_dict(), "mode": best[1], "mu": mu, "sd": sd,
-                    "programs": tr["programs"]}, args.save_router)
+        torch.save({"state": best[2].state_dict(), "mode": best[1], "mu": best[3], "sd": best[4],
+                    "programs": va["programs"]}, args.save_router)
         print(f"saved router to {args.save_router}")
 
 
