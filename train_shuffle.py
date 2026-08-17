@@ -47,6 +47,11 @@ def get_args():
     ap.add_argument("--attn_dropout", type=float, default=-1.0,
                     help="attention-matrix dropout; -1 = same as --dropout; set 0 on MPS")
     ap.add_argument("--softcap", type=float, default=30.0)
+    ap.add_argument("--mlp_ratio", type=float, default=4.0,
+                    help="FFN hidden dim as multiple of n_embd")
+    ap.add_argument("--shared_mlp", action="store_true",
+                    help="one FFN shared across all blocks (attn/norms stay per-block); "
+                         "combine with a larger --mlp_ratio to reinvest the saved params")
     # random-program depth
     ap.add_argument("--min_depth", type=int, default=4)
     ap.add_argument("--max_depth", type=int, default=32)
@@ -116,6 +121,7 @@ def main():
         vocab_size=meta["vocab_size"], block_size=args.block_size,
         n_layer=args.n_layer, n_head=args.n_head, n_embd=args.n_embd,
         dropout=args.dropout, attn_dropout=args.attn_dropout, softcap=args.softcap,
+        mlp_ratio=args.mlp_ratio, shared_mlp=args.shared_mlp,
     )
     if device == "mps" and (args.attn_dropout if args.attn_dropout >= 0 else args.dropout) > 0:
         print("WARNING: attn dropout > 0 on MPS forces unfused attention and will "

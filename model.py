@@ -24,6 +24,8 @@ class GPTConfig:
     attn_dropout: float = -1.0  # dropout on the attention matrix; -1 = same as dropout
     softcap: float = 30.0  # 0 disables
     loops: int = 1  # apply each block this many times (weight-shared depth)
+    mlp_ratio: float = 4.0  # FFN hidden dim = mlp_ratio * n_embd
+    shared_mlp: bool = False  # one FFN shared by every block (attn/norms stay per-block)
 
 
 class Rotary(nn.Module):
@@ -78,8 +80,9 @@ class Attention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, cfg: GPTConfig):
         super().__init__()
-        self.up = nn.Linear(cfg.n_embd, 4 * cfg.n_embd, bias=False)
-        self.down = nn.Linear(4 * cfg.n_embd, cfg.n_embd, bias=False)
+        hidden = int(cfg.mlp_ratio * cfg.n_embd)
+        self.up = nn.Linear(cfg.n_embd, hidden, bias=False)
+        self.down = nn.Linear(hidden, cfg.n_embd, bias=False)
         self.down.weight.detach().zero_()
         self.drop = nn.Dropout(cfg.dropout)
 
@@ -111,6 +114,11 @@ class GPT(nn.Module):
         nn.init.normal_(self.embed.weight, std=0.02)
         self.embed_drop = nn.Dropout(cfg.dropout)
         self.blocks = nn.ModuleList(Block(cfg) for _ in range(cfg.n_layer))
+        if cfg.shared_mlp:
+            # blocks differ only in attention + norms; norm2 stays per-block so
+            # each block can scale its input into the shared FFN differently
+            for b in self.blocks[1:]:
+                b.mlp = self.blocks[0].mlp
         self.norm_f = nn.RMSNorm(cfg.n_embd, elementwise_affine=True)
         self.lm_head = nn.Linear(cfg.n_embd, cfg.vocab_size, bias=False)
         self.lm_head.weight = self.embed.weight  # tied
