@@ -32,8 +32,6 @@ Then, I asked myself whether just shuffling layers would help, on no other basis
 
 ## Going a little further and heavily sharing weights
 
+.md version of this blog post is available here: https://github.com/edereynaldesaintmichel/SampleEfficiency/blob/main/blog_post.md
 
-
-If you wat to go deeper, just clone the repo: https://github.com/edereynaldesaintmichel/SampleEfficiency, and ask Claude Code.
-
-.md version of this blog post is available here: 
+All the code is available on the repo, so just ask an LLM if you want to go deeper into a certain aspect of these experiments.
