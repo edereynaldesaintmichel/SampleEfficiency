@@ -53,6 +53,10 @@ def get_args():
                     help="one FFN shared across all blocks (attn/norms stay per-block); "
                          "combine with a larger --mlp_ratio to reinvest the saved params")
     # random-program depth
+    ap.add_argument("--act", type=str, default="relu2", choices=["relu2", "step", "dead", "noisy"],
+                    help="MLP activation: relu2 | step relu²-c·H(z) | dead relu(z-c)² | noisy relu(z+c·ε)²")
+    ap.add_argument("--act_c", type=float, default=0.0,
+                    help="activation constant c: step size, dead-zone width, or noise std")
     ap.add_argument("--min_depth", type=int, default=4)
     ap.add_argument("--max_depth", type=int, default=32)
     # optimization
@@ -122,6 +126,7 @@ def main():
         n_layer=args.n_layer, n_head=args.n_head, n_embd=args.n_embd,
         dropout=args.dropout, attn_dropout=args.attn_dropout, softcap=args.softcap,
         mlp_ratio=args.mlp_ratio, shared_mlp=args.shared_mlp,
+        act=args.act, act_c=args.act_c,
     )
     if device == "mps" and (args.attn_dropout if args.attn_dropout >= 0 else args.dropout) > 0:
         print("WARNING: attn dropout > 0 on MPS forces unfused attention and will "
@@ -141,7 +146,8 @@ def main():
         eval_cfgs.append((f"r{d}", rng_seq.integers(0, args.n_layer, d).tolist()))
     names = [n for n, _ in eval_cfgs]
     print(f"device={device}  params={model.num_params()/1e6:.2f}M  vocab={cfg.vocab_size}  "
-          f"depth U{{{args.min_depth}..{args.max_depth}}} over {args.n_layer} blocks")
+          f"depth U{{{args.min_depth}..{args.max_depth}}} over {args.n_layer} blocks  "
+          f"act={args.act} c={args.act_c}")
     for n, s in eval_cfgs:
         print(f"  eval {n}: {s}")
     print(f"train: {len(train_ids):,} tokens  |  epoch = {len(train_ids)//(args.batch_size*args.block_size):,} steps")
@@ -184,11 +190,15 @@ def main():
         """Paired comparison: loss of the SAME batch at every eval config,
         dropout off, so config gaps aren't confounded by batch/mask noise."""
         model.eval()
+        for b in model.blocks:
+            b.mlp.stats = True  # pre-activation diagnostics, this pass only
         out = []
         for _, seq in eval_cfgs:
             model.set_layer_seq(seq)
             _, loss = model(x, y)
             out.append(loss.item())
+        for b in model.blocks:
+            b.mlp.stats = False
         model.set_layer_seq(None)
         model.train()
         return out
@@ -278,8 +288,12 @@ def main():
             tstr = "  ".join(f"{n} {t:.3f}" for n, t in zip(names, ts))
             qstr = "  ".join(f"{n} {q:.3f}" for n, q in zip(names, qs))
             gstr = f"  gate {running_gate:.2f}" if args.ce_floor > 0 else ""
+            z_rms = float(np.mean([b.mlp.z_rms.item() for b in model.blocks]))
+            zstr = f"  z_rms {z_rms:.3f}"
+            if model.blocks[0].mlp.z_small is not None:
+                zstr += f"  small {float(np.mean([b.mlp.z_small.item() for b in model.blocks])):.2f}"
             print(f"step {step:6d}  loss {running_loss:.4f}{gstr}  d{depth:2d}  "
-                  f"train [{tstr}]  val~bpb [{qstr}]  lr x{m:.3f}  {time.time()-t0:.0f}s", flush=True)
+                  f"train [{tstr}]  val~bpb [{qstr}]{zstr}  lr x{m:.3f}  {time.time()-t0:.0f}s", flush=True)
             with open(log_path, "a") as f:
                 f.write(f"{step},{m:.4f},{running_loss:.4f},"
                         + ",".join(f"{t:.4f}" for t in ts) + ","

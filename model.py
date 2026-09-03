@@ -26,6 +26,8 @@ class GPTConfig:
     loops: int = 1  # apply each block this many times (weight-shared depth)
     mlp_ratio: float = 4.0  # FFN hidden dim = mlp_ratio * n_embd
     shared_mlp: bool = False  # one FFN shared by every block (attn/norms stay per-block)
+    act: str = "relu2"  # MLP activation: relu2 | step | dead | noisy (see MLP)
+    act_c: float = 0.0  # activation constant: step size c, dead-zone width, or noise std
 
 
 class Rotary(nn.Module):
@@ -78,6 +80,21 @@ class Attention(nn.Module):
 
 
 class MLP(nn.Module):
+    """ReLU² FFN, optionally with a per-switch amplitude floor (cfg.act, cfg.act_c = c):
+
+      relu2 : relu(z)²                                              (default)
+      step  : relu(z)² - c·H(z)   every switch is a jump of fixed size c along the
+              neuron's down-weight, so no switch can be low-amplitude; the
+              quadratic part only dominates once z > sqrt(c). c < 0 adds the
+              step instead of subtracting it (monotone variant).
+      dead  : relu(z - c)²        a crossing only counts once it clears c
+      noisy : relu(z + c·ε)²      (train only) crossings with |z| ≲ c are
+              unreliable, so the network learns not to depend on them
+
+    The step's gradient is zero, so optimization sees plain relu²; only the
+    forward function (and hence the loss) feels the jumps.
+    """
+
     def __init__(self, cfg: GPTConfig):
         super().__init__()
         hidden = int(cfg.mlp_ratio * cfg.n_embd)
@@ -85,9 +102,37 @@ class MLP(nn.Module):
         self.down = nn.Linear(hidden, cfg.n_embd, bias=False)
         self.down.weight.detach().zero_()
         self.drop = nn.Dropout(cfg.dropout)
+        self.act, self.c = cfg.act, float(cfg.act_c)
+        if self.act not in ("relu2", "step", "dead", "noisy"):
+            raise ValueError(f"unknown act {self.act!r}")
+        # diagnostics, computed only while self.stats is True (training loop sets
+        # it on log steps): pre-activation RMS and the fraction of |z| below the
+        # floor's own scale (sqrt(c) for step, c otherwise)
+        self.stats = False
+        self.z_rms = None
+        self.z_small = None
+
+    def _act(self, z: torch.Tensor) -> torch.Tensor:
+        c = self.c
+        if self.act == "relu2" or c == 0.0:
+            return F.relu(z).square()
+        if self.act == "step":
+            return F.relu(z).square() - c * (z > 0).to(z.dtype)
+        if self.act == "dead":
+            return F.relu(z - c).square()
+        if self.training:  # noisy
+            z = z + c * torch.randn_like(z)
+        return F.relu(z).square()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.drop(self.down(F.relu(self.up(x)).square()))
+        z = self.up(x)
+        if self.stats:
+            with torch.no_grad():
+                zf = z.detach().float()
+                self.z_rms = zf.square().mean().sqrt()
+                scale = abs(self.c) ** 0.5 if self.act == "step" else abs(self.c)
+                self.z_small = (zf.abs() < scale).float().mean() if scale > 0 else None
+        return self.drop(self.down(self._act(z)))
 
 
 class Block(nn.Module):
