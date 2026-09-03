@@ -65,6 +65,10 @@ def get_args():
     ap.add_argument("--device", type=str, default="auto")
     ap.add_argument("--no_amp", action="store_true", help="disable bf16 autocast (CUDA only; evals always run fp32)")
     ap.add_argument("--compile", action="store_true")
+    ap.add_argument("--init_from", type=str, default="",
+                    help="warm-start: load model (and EMA shadow if present) from this .pt; optimizers start fresh")
+    ap.add_argument("--start_step", type=int, default=0,
+                    help="first step of the LR schedule (use with --init_from to resume a longer schedule)")
     return ap.parse_args()
 
 
@@ -163,6 +167,16 @@ def main():
         return x.to(device), y.to(device)
 
     ema = EMA(model, args.ema_decay)
+    if args.init_from:
+        ckpt = torch.load(args.init_from, map_location=device)
+        model.load_state_dict(ckpt["model"])
+        if "ema" in ckpt:
+            for k, v in ckpt["ema"].items():
+                if k in ema.shadow:
+                    ema.shadow[k].copy_(v.float())
+        else:
+            ema = EMA(model, args.ema_decay)
+        print(f"init_from {args.init_from} (ema={'ema' in ckpt}), schedule resumes at step {args.start_step}")
     eval_model = copy.deepcopy(model)  # holds EMA weights during eval
 
     nats_to_bpb = (meta["val_tokens"] / meta["val_bytes"]) / math.log(2)
@@ -198,7 +212,7 @@ def main():
     t0 = time.time()
     running_loss = None
 
-    for step in range(args.steps):
+    for step in range(args.start_step, args.steps):
         m = lr_mult(step)
         for opt, peak in zip(optimizers, peak_lrs):
             for g in opt.param_groups:
