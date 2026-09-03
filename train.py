@@ -38,6 +38,10 @@ def get_args():
     ap.add_argument("--attn_dropout", type=float, default=-1.0,
                     help="attention-matrix dropout; -1 = same as --dropout; set 0 on MPS")
     ap.add_argument("--softcap", type=float, default=30.0)
+    ap.add_argument("--act", type=str, default="relu2", choices=["relu2", "step", "dead", "noisy"],
+                    help="MLP activation: relu2 | step relu²-c·H(z) | dead relu(z-c)² | noisy relu(z+c·ε)²")
+    ap.add_argument("--act_c", type=float, default=0.0,
+                    help="activation constant c: step size, dead-zone width, or noise std")
     # optimization
     ap.add_argument("--steps", type=int, default=50000)
     ap.add_argument("--batch_size", type=int, default=32)
@@ -118,6 +122,7 @@ def main():
         vocab_size=meta["vocab_size"], block_size=args.block_size,
         n_layer=args.n_layer, n_head=args.n_head, n_embd=args.n_embd,
         dropout=args.dropout, attn_dropout=args.attn_dropout, softcap=args.softcap,
+        act=args.act, act_c=args.act_c,
     )
     if device == "mps" and (args.attn_dropout if args.attn_dropout >= 0 else args.dropout) > 0:
         print("WARNING: attn dropout > 0 on MPS forces unfused attention and will "
@@ -125,7 +130,8 @@ def main():
     model = GPT(cfg).to(device)
     if args.compile:
         model = torch.compile(model)
-    print(f"device={device}  params={model.num_params()/1e6:.2f}M  vocab={cfg.vocab_size}")
+    print(f"device={device}  params={model.num_params()/1e6:.2f}M  vocab={cfg.vocab_size}  "
+          f"act={args.act} c={args.act_c}")
     print(f"train: {len(train_ids):,} tokens  |  epoch = {len(train_ids)//(args.batch_size*args.block_size):,} steps")
 
     # Muon for 2D hidden matrices, AdamW for embeddings (=tied head) and norm gains
@@ -165,6 +171,8 @@ def main():
     def quick_val_bpb() -> float:
         """Cheap val estimate: mean loss over a few random val windows -> approx bpb."""
         model.eval()
+        for b in model.blocks:
+            b.mlp.stats = True  # pre-activation diagnostics, this pass only
         total, n = 0.0, 0
         for _ in range(args.quick_eval_batches):
             ix = np.random.randint(0, len(val_ids) - args.block_size - 1, size=args.eval_batch_size)
@@ -173,6 +181,8 @@ def main():
             _, loss = model(x, y)
             total += loss.item()
             n += 1
+        for b in model.blocks:
+            b.mlp.stats = False
         model.train()
         return total / n * nats_to_bpb
 
@@ -210,7 +220,11 @@ def main():
         running_loss = l if running_loss is None else 0.99 * running_loss + 0.01 * l
         if step % args.log_interval == 0:
             qbpb = quick_val_bpb()
-            print(f"step {step:6d}  loss {running_loss:.4f}  val~bpb {qbpb:.4f}  "
+            z_rms = float(np.mean([b.mlp.z_rms.item() for b in model.blocks]))
+            zstr = f"  z_rms {z_rms:.3f}"
+            if model.blocks[0].mlp.z_small is not None:
+                zstr += f"  small {float(np.mean([b.mlp.z_small.item() for b in model.blocks])):.2f}"
+            print(f"step {step:6d}  loss {running_loss:.4f}  val~bpb {qbpb:.4f}{zstr}  "
                   f"lr x{m:.3f}  {time.time()-t0:.0f}s", flush=True)
             with open(log_path, "a") as f:
                 f.write(f"{step},{m:.4f},{running_loss:.4f},{qbpb:.4f},,,{time.time()-t0:.0f}\n")
